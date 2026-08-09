@@ -10,7 +10,8 @@
     "build": "next build",
     "start": "cross-env NODE_ENV=production tsx server.ts",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/postinstall-puppeteer.mjs"
   },
   "dependencies": {
     "@next/env": "16.3.0",

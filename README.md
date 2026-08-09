@@ -242,6 +242,17 @@ exact schema wasn't verified against Render's current docs in this session
 starting point: if the blueprint import errors or looks off, fall back to
 the manual steps above, which don't depend on that file at all.
 
+**If the service ends up on Render's native Node environment instead of
+Docker** (e.g. Render auto-detected Node and the Docker runtime wasn't
+explicitly selected), Puppeteer needs its own downloaded Chrome rather than
+relying on the Dockerfile's system Chromium. A `postinstall` script
+(`scripts/postinstall-puppeteer.mjs`) runs `npx puppeteer browsers install
+chrome` automatically on every `npm install`/deploy to guard against this —
+it's a no-op if Chrome is already cached, and is itself skipped when
+`PUPPETEER_SKIP_DOWNLOAD` is set (the Docker build path). If you still see
+`Could not find Chrome` in the logs, trigger a fresh deploy (Manual Deploy →
+Clear build cache & deploy) so the postinstall step re-runs.
+
 ## Manual test checklist
 
 1. **QR** — fresh `MONGODB_URI` (no session yet) → `/whatsapp` shows a QR
