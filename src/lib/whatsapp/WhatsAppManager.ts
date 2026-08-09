@@ -1,7 +1,4 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, statfsSync } from "node:fs";
-import path from "node:path";
-import { getInstalledBrowsers } from "@puppeteer/browsers";
+import chromium from "@sparticuz/chromium";
 import mongoose from "mongoose";
 import QRCode from "qrcode";
 import { Client, RemoteAuth, type Chat as WWebChat, type Message as WWebMessage } from "whatsapp-web.js";
@@ -43,109 +40,42 @@ export class WhatsAppHttpError extends Error {
   }
 }
 
-function runPuppeteerCli(cliPath: string, args: string[], timeoutMs: number) {
-  const result = spawnSync(process.execPath, [cliPath, ...args], {
-    timeout: timeoutMs,
-    encoding: "utf8",
-  });
-  return {
-    status: result.status,
-    stdout: (result.stdout ?? "").trim(),
-    stderr: (result.stderr ?? "").trim(),
-    error: result.error,
-  };
-}
+const DEFAULT_LAUNCH_ARGS = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"];
+
+type LaunchConfig = { executablePath: string | undefined; args: string[] };
 
 /**
- * Puppeteer is supposed to download its own Chrome during `npm install`,
- * but some PaaS build caches (observed on Render's native Node
- * environment) restore node_modules from a snapshot in a way that skips
- * that download, leaving "Could not find Chrome" only once the server
- * actually tries to launch it. A build-time postinstall step can't be
- * trusted to always run, so this checks/installs at runtime instead —
- * synchronously, in the same process and filesystem that is about to
- * launch Puppeteer, right before it does.
+ * Relying on Puppeteer's own runtime Chrome download/cache machinery
+ * (`puppeteer browsers install/list`) proved unreliable specifically on
+ * Render's native Node environment: repeated attempts showed the install
+ * reporting success, and even Puppeteer's own structured
+ * getInstalledBrowsers() API confirming the binary as installed, while an
+ * existsSync() check on that exact same path still failed moments later —
+ * a platform-specific quirk that couldn't be root-caused further without
+ * shell access to Render itself.
  *
- * Resolves Puppeteer's own local CLI script directly (not via `npx`) so
- * this is guaranteed to run the exact same puppeteer install that
- * whatsapp-web.js itself requires — no risk of npx resolving a different
- * globally-fetched puppeteer version whose Chrome build id wouldn't match.
- *
- * Returns the resolved executable path to pass explicitly as
- * `puppeteer.executablePath` on the Client. Setting PUPPETEER_CACHE_DIR
- * alone is NOT enough: `import { Client } from "whatsapp-web.js"` at the
- * top of this file already required puppeteer (which computes its default
- * cache/executable path at that point) before this function — which runs
- * later, inside initialize() — ever gets a chance to set the env var. By
- * the time it's set, Puppeteer's own module-level default is already
- * fixed, so the only reliable way to point it at the installed browser is
- * to hand it the resolved path directly.
- *
- * The install step still shells out to Puppeteer's own CLI (it correctly
- * resolves the exact Chrome build id this puppeteer version expects,
- * without needing that hardcoded here), but the *lookup* of what actually
- * ended up installed uses @puppeteer/browsers' structured
- * getInstalledBrowsers() API directly — not text-parsed CLI output — so
- * there's no risk of a parsing mismatch producing a path that looks right
- * but isn't the one Puppeteer itself would resolve.
+ * @sparticuz/chromium sidesteps all of that: its Chromium binary ships
+ * pre-downloaded *inside* the npm package (as a compressed archive),
+ * extracted to a writable temp dir on first use — no separate runtime
+ * network download/install step at all, so there's nothing left for a
+ * PaaS's build/runtime environment to handle inconsistently. Verified
+ * locally end-to-end (real page navigation, DOM access, clean shutdown).
  */
-async function resolveChromeExecutablePath(): Promise<string | undefined> {
+async function resolveLaunchConfig(): Promise<LaunchConfig> {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    // Docker build path: a system Chromium is already provided.
+    // Docker build path: a full system Chromium (apt-installed) is already provided.
     logger.info("Using PUPPETEER_EXECUTABLE_PATH (Docker/system Chromium)");
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
+    return { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, args: DEFAULT_LAUNCH_ARGS };
   }
-
-  if (!process.env.PUPPETEER_CACHE_DIR) {
-    process.env.PUPPETEER_CACHE_DIR = path.join("/tmp", "puppeteer-cache");
-  }
-  const cacheDir = process.env.PUPPETEER_CACHE_DIR;
 
   try {
-    const fsStats = statfsSync("/tmp");
-    const freeMb = Math.round((fsStats.bavail * fsStats.bsize) / 1024 / 1024);
-    logger.info(`Chrome cache dir: ${cacheDir} (/tmp has ${freeMb}MB free)`);
+    const executablePath = await chromium.executablePath();
+    logger.info(`Resolved bundled Chromium executable: ${executablePath}`);
+    return { executablePath, args: chromium.args };
   } catch (err) {
-    logger.warn("Could not stat /tmp filesystem", err instanceof Error ? err.message : err);
+    logger.error("Failed to resolve @sparticuz/chromium executable", err instanceof Error ? err.message : err);
+    return { executablePath: undefined, args: DEFAULT_LAUNCH_ARGS };
   }
-
-  let cliPath: string;
-  try {
-    cliPath = require.resolve("puppeteer/lib/cjs/puppeteer/node/cli.js");
-  } catch (err) {
-    logger.error("Could not resolve puppeteer's CLI script", err);
-    return undefined;
-  }
-
-  logger.info(`Installing Chrome for Puppeteer via ${cliPath}`);
-  const install = runPuppeteerCli(cliPath, ["browsers", "install", "chrome"], 180_000);
-  if (install.error) {
-    logger.error("Chrome install process failed to start", install.error.message);
-  } else {
-    logger.info(
-      `Chrome install exit=${install.status} stdout="${install.stdout || "(empty)"}" stderr="${install.stderr || "(empty)"}"`,
-    );
-  }
-
-  let installed: Awaited<ReturnType<typeof getInstalledBrowsers>>;
-  try {
-    installed = await getInstalledBrowsers({ cacheDir });
-  } catch (err) {
-    logger.error("getInstalledBrowsers() failed", err instanceof Error ? err.message : err);
-    return undefined;
-  }
-  logger.info(`getInstalledBrowsers(): ${JSON.stringify(installed.map((b) => ({ browser: b.browser, buildId: b.buildId, executablePath: b.executablePath })))}`);
-
-  const chrome = installed.find((b) => b.browser === "chrome");
-  if (!chrome || !existsSync(chrome.executablePath)) {
-    logger.error(
-      `Could not resolve a usable Chrome executable path (found: ${chrome?.executablePath ?? "none"})`,
-    );
-    return undefined;
-  }
-
-  logger.info(`Resolved Chrome executable path: ${chrome.executablePath}`);
-  return chrome.executablePath;
 }
 
 export class WhatsAppManager {
@@ -164,8 +94,8 @@ export class WhatsAppManager {
   private shuttingDown = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private chromeResolved = false;
-  private chromeExecutablePath: string | undefined = undefined;
+  private launchConfigResolved = false;
+  private launchConfig: LaunchConfig = { executablePath: undefined, args: DEFAULT_LAUNCH_ARGS };
 
   attachIO(io: SocketIOServer): void {
     this.io = io;
@@ -194,9 +124,9 @@ export class WhatsAppManager {
       await connectToDatabase();
       await this.setStatus("INITIALIZING");
 
-      if (!this.chromeResolved) {
-        this.chromeExecutablePath = await resolveChromeExecutablePath();
-        this.chromeResolved = true;
+      if (!this.launchConfigResolved) {
+        this.launchConfig = await resolveLaunchConfig();
+        this.launchConfigResolved = true;
       }
 
       const store = new MongoStore({ mongoose });
@@ -210,8 +140,8 @@ export class WhatsAppManager {
         }),
         puppeteer: {
           headless: true,
-          executablePath: this.chromeExecutablePath,
-          args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+          executablePath: this.launchConfig.executablePath,
+          args: this.launchConfig.args,
         },
       });
 

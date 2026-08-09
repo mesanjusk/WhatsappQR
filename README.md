@@ -205,26 +205,37 @@ continuously, like Render, Railway, Fly.io, or a VPS.
 
 ### Deploying to Render
 
-The repo includes a `Dockerfile` that installs system Chromium and the
-runtime libraries Puppeteer needs to launch headless.
+Render works with **either** its Docker runtime or its native Node
+runtime — both are fully supported:
+
+- **Docker** (the repo includes a `Dockerfile`): installs a system
+  Chromium via apt and points Puppeteer at it via `PUPPETEER_EXECUTABLE_PATH`.
+- **Native Node**: `WhatsAppManager` resolves Chromium via
+  [`@sparticuz/chromium`](https://github.com/Sparticuz/chromium) instead —
+  a Chromium binary that ships pre-bundled *inside* the npm package itself
+  (extracted to a writable temp dir on first use), so there's no separate
+  runtime download/install step for a PaaS build to handle inconsistently.
+  This was the fix for repeated `Could not find Chrome` failures seen when
+  relying on Puppeteer's own runtime download machinery on Render's native
+  environment — verified locally end-to-end (real page navigation, DOM
+  access, clean shutdown) before shipping.
+
+Either way works; you don't need to force a specific runtime choice in the
+Render UI.
 
 1. **MongoDB**: Render doesn't offer managed MongoDB — use
    [MongoDB Atlas](https://www.mongodb.com/atlas) (the free M0 tier works
    fine for an MVP) and copy its connection string.
 2. In the Render dashboard: **New +** → **Web Service** → connect this
    GitHub repo (branch `claude/whatsapp-web-clone-mvp-gzz87q`, or whichever
-   branch you're deploying).
-3. Render should detect the `Dockerfile` and offer **Docker** as the
-   runtime/environment — pick that (do *not* pick the Node native
-   environment; it won't have Chromium's system libraries). No build/start
-   command fields are needed — the Dockerfile's own build steps and
-   `CMD ["npm", "start"]` handle both.
-4. **Plan**: pick at least the paid **Starter** instance type, not Free.
+   branch you're deploying). Let Render auto-detect the environment
+   (Docker if it picks up the Dockerfile, Node otherwise) — both work.
+3. **Plan**: pick at least the paid **Starter** instance type, not Free.
    Render's free web services spin down after ~15 minutes of inactivity,
    which would kill the live WhatsApp/Puppeteer session and stop real-time
    incoming messages from being received while spun down — this app needs
    an always-on instance.
-5. Add the environment variables (Settings → Environment):
+4. Add the environment variables (Settings → Environment):
    - `MONGODB_URI` — your Atlas connection string
    - `ADMIN_EMAIL`, `ADMIN_PASSWORD` — your login credentials
    - `JWT_SECRET` — a long random string (`openssl rand -hex 48`)
@@ -232,8 +243,8 @@ runtime libraries Puppeteer needs to launch headless.
      (Render shows this after the first deploy; fill it in and redeploy)
    - `WHATSAPP_SESSION_ID=default`,
      `WHATSAPP_BACKUP_SYNC_INTERVAL_MS=300000`
-6. Deploy. Render builds the Docker image and starts the service, listening
-   on the `PORT` it injects automatically (already handled by `server.ts`).
+5. Deploy. The service starts and listens on the `PORT` Render injects
+   automatically (already handled by `server.ts`).
 
 A `render.yaml` blueprint is also included as a convenience for Render's
 **New +** → **Blueprint** flow, which can pre-fill most of this — but its
@@ -241,26 +252,6 @@ exact schema wasn't verified against Render's current docs in this session
 (this sandbox has no network access to render.com), so treat it as a
 starting point: if the blueprint import errors or looks off, fall back to
 the manual steps above, which don't depend on that file at all.
-
-**If the service ends up on Render's native Node environment instead of
-Docker** (e.g. Render auto-detected Node and the Docker runtime wasn't
-explicitly selected), Puppeteer needs its own downloaded Chrome rather than
-relying on the Dockerfile's system Chromium. Two layers guard against this:
-
-1. A `postinstall` script (`scripts/postinstall-puppeteer.mjs`) installs
-   Chrome during `npm install`/deploy — skipped when `PUPPETEER_SKIP_DOWNLOAD`
-   is set (the Docker path).
-2. `WhatsAppManager.initialize()` also checks/installs Chrome itself at
-   **runtime**, on first boot, before launching Puppeteer — because a
-   build-time step alone can't be trusted to always run on every PaaS's
-   build cache. It pins `PUPPETEER_CACHE_DIR` to `/tmp/puppeteer-cache` (a
-   location that's reliably writable in virtually any container, unlike
-   `$HOME/.cache` which varies by platform) so the install and the later
-   browser launch are guaranteed to agree on the same path, and logs the
-   install output, a `browsers list` check, and free disk space on `/tmp`
-   — so if Chrome still can't be found, the logs will show exactly why
-   (e.g. disk space exhausted, a permissions error, or the install
-   genuinely failing) instead of just the generic downstream error.
 
 ## Manual test checklist
 
