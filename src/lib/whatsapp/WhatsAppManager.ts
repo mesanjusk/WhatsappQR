@@ -31,6 +31,10 @@ const MAX_HISTORY_PER_CHAT = 30;
 const MIN_STORED_MESSAGES_BEFORE_BACKFILL = 10;
 const MAX_MESSAGE_LENGTH = 4096;
 const RECONNECT_DELAYS_MS = [2000, 5000, 10000, 30000, 60000];
+// whatsapp-web.js's own page load for WhatsApp Web uses no navigation
+// timeout at all (it waits forever), so a stuck browser/page load would
+// otherwise hang initialize() indefinitely with no error and no retry.
+const INIT_TIMEOUT_MS = 90_000;
 
 export class WhatsAppHttpError extends Error {
   statusCode: number;
@@ -38,6 +42,22 @@ export class WhatsAppHttpError extends Error {
     super(message);
     this.statusCode = statusCode;
   }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 const DEFAULT_LAUNCH_ARGS = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"];
@@ -150,6 +170,10 @@ export class WhatsAppManager {
           headless: true,
           executablePath: this.launchConfig.executablePath,
           args: this.launchConfig.args,
+          // Pipes Chromium's own stdout/stderr straight to this process's,
+          // so a launch/page-load hang shows Chromium's own diagnostics in
+          // the deploy logs instead of just silence.
+          dumpio: true,
         },
       });
 
@@ -157,11 +181,26 @@ export class WhatsAppManager {
       this.registerEventHandlers(client);
 
       logger.info("Initializing client");
-      await client.initialize();
+      await withTimeout(client.initialize(), INIT_TIMEOUT_MS, "client.initialize()");
     } catch (err) {
       logger.error("Failed to initialize WhatsApp client", err);
       this.lastError = err instanceof Error ? err.message : "Unknown initialization error";
+      const hungClient = this.client;
       this.client = null;
+      if (hungClient) {
+        // A timed-out initialize() promise keeps running in the background
+        // (Node can't truly cancel it) — force-destroy so the underlying
+        // browser process doesn't linger and emit confusing zombie events
+        // after we've already moved on to a reconnect attempt.
+        try {
+          await hungClient.destroy();
+        } catch (destroyErr) {
+          logger.warn(
+            "Error destroying client after failed/hung initialize()",
+            destroyErr instanceof Error ? destroyErr.message : destroyErr,
+          );
+        }
+      }
       await this.setStatus("DISCONNECTED", { lastDisconnectedAt: new Date() });
       this.scheduleReconnect();
     } finally {
