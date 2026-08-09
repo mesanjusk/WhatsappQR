@@ -70,18 +70,21 @@ function runPuppeteerCli(cliPath: string, args: string[], timeoutMs: number) {
  * whatsapp-web.js itself requires — no risk of npx resolving a different
  * globally-fetched puppeteer version whose Chrome build id wouldn't match.
  *
- * Also pins PUPPETEER_CACHE_DIR to an explicit, universally-writable /tmp
- * path (rather than trusting whatever $HOME/.cache resolves to on a given
- * PaaS) so the install step and the later browser launch are guaranteed to
- * agree on the same location, and logs a `browsers list` + disk-space
- * check immediately after so the outcome is unambiguous in the logs either
- * way.
+ * Returns the resolved executable path to pass explicitly as
+ * `puppeteer.executablePath` on the Client. Setting PUPPETEER_CACHE_DIR
+ * alone is NOT enough: `import { Client } from "whatsapp-web.js"` at the
+ * top of this file already required puppeteer (which computes its default
+ * cache/executable path at that point) before this function — which runs
+ * later, inside initialize() — ever gets a chance to set the env var. By
+ * the time it's set, Puppeteer's own module-level default is already
+ * fixed, so the only reliable way to point it at the installed browser is
+ * to hand it the resolved path directly.
  */
-function ensureChromeInstalled(): void {
+function resolveChromeExecutablePath(): string | undefined {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     // Docker build path: a system Chromium is already provided.
-    logger.info("Skipping Chrome install check (PUPPETEER_EXECUTABLE_PATH is set)");
-    return;
+    logger.info("Using PUPPETEER_EXECUTABLE_PATH (Docker/system Chromium)");
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
 
   if (!process.env.PUPPETEER_CACHE_DIR) {
@@ -102,7 +105,7 @@ function ensureChromeInstalled(): void {
     cliPath = require.resolve("puppeteer/lib/cjs/puppeteer/node/cli.js");
   } catch (err) {
     logger.error("Could not resolve puppeteer's CLI script", err);
-    return;
+    return undefined;
   }
 
   logger.info(`Installing Chrome for Puppeteer via ${cliPath}`);
@@ -118,6 +121,18 @@ function ensureChromeInstalled(): void {
   const list = runPuppeteerCli(cliPath, ["browsers", "list"], 30_000);
   logger.info(`Installed browsers per cache dir: "${list.stdout || "(none)"}" stderr="${list.stderr || "(empty)"}"`);
   logger.info(`Cache dir exists on disk: ${existsSync(cacheDir)}`);
+
+  // Parse a line like: "chrome@146.0.7680.31 (linux) /tmp/puppeteer-cache/chrome/linux-146.0.7680.31/chrome-linux64/chrome"
+  const chromeLine = list.stdout.split("\n").find((line) => line.trim().startsWith("chrome@"));
+  const executablePath = chromeLine?.trim().split(/\s+/).pop();
+
+  if (!executablePath || !existsSync(executablePath)) {
+    logger.error(`Could not resolve a usable Chrome executable path (parsed: ${executablePath ?? "none"})`);
+    return undefined;
+  }
+
+  logger.info(`Resolved Chrome executable path: ${executablePath}`);
+  return executablePath;
 }
 
 export class WhatsAppManager {
@@ -136,7 +151,8 @@ export class WhatsAppManager {
   private shuttingDown = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private chromeEnsured = false;
+  private chromeResolved = false;
+  private chromeExecutablePath: string | undefined = undefined;
 
   attachIO(io: SocketIOServer): void {
     this.io = io;
@@ -165,14 +181,13 @@ export class WhatsAppManager {
       await connectToDatabase();
       await this.setStatus("INITIALIZING");
 
-      if (!this.chromeEnsured) {
-        ensureChromeInstalled();
-        this.chromeEnsured = true;
+      if (!this.chromeResolved) {
+        this.chromeExecutablePath = resolveChromeExecutablePath();
+        this.chromeResolved = true;
       }
 
       const store = new MongoStore({ mongoose });
       const backupSyncIntervalMs = Number(process.env.WHATSAPP_BACKUP_SYNC_INTERVAL_MS) || 5 * 60 * 1000;
-      const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
       const client = new Client({
         authStrategy: new RemoteAuth({
@@ -182,7 +197,7 @@ export class WhatsAppManager {
         }),
         puppeteer: {
           headless: true,
-          executablePath,
+          executablePath: this.chromeExecutablePath,
           args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         },
       });
