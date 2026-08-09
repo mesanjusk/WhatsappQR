@@ -245,13 +245,22 @@ the manual steps above, which don't depend on that file at all.
 **If the service ends up on Render's native Node environment instead of
 Docker** (e.g. Render auto-detected Node and the Docker runtime wasn't
 explicitly selected), Puppeteer needs its own downloaded Chrome rather than
-relying on the Dockerfile's system Chromium. A `postinstall` script
-(`scripts/postinstall-puppeteer.mjs`) runs `npx puppeteer browsers install
-chrome` automatically on every `npm install`/deploy to guard against this —
-it's a no-op if Chrome is already cached, and is itself skipped when
-`PUPPETEER_SKIP_DOWNLOAD` is set (the Docker build path). If you still see
-`Could not find Chrome` in the logs, trigger a fresh deploy (Manual Deploy →
-Clear build cache & deploy) so the postinstall step re-runs.
+relying on the Dockerfile's system Chromium. Two layers guard against this:
+
+1. A `postinstall` script (`scripts/postinstall-puppeteer.mjs`) installs
+   Chrome during `npm install`/deploy — skipped when `PUPPETEER_SKIP_DOWNLOAD`
+   is set (the Docker path).
+2. `WhatsAppManager.initialize()` also checks/installs Chrome itself at
+   **runtime**, on first boot, before launching Puppeteer — because a
+   build-time step alone can't be trusted to always run on every PaaS's
+   build cache. It pins `PUPPETEER_CACHE_DIR` to `/tmp/puppeteer-cache` (a
+   location that's reliably writable in virtually any container, unlike
+   `$HOME/.cache` which varies by platform) so the install and the later
+   browser launch are guaranteed to agree on the same path, and logs the
+   install output, a `browsers list` check, and free disk space on `/tmp`
+   — so if Chrome still can't be found, the logs will show exactly why
+   (e.g. disk space exhausted, a permissions error, or the install
+   genuinely failing) instead of just the generic downstream error.
 
 ## Manual test checklist
 

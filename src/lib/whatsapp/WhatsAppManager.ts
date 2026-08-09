@@ -1,4 +1,6 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { existsSync, statfsSync } from "node:fs";
+import path from "node:path";
 import mongoose from "mongoose";
 import QRCode from "qrcode";
 import { Client, RemoteAuth, type Chat as WWebChat, type Message as WWebMessage } from "whatsapp-web.js";
@@ -40,6 +42,19 @@ export class WhatsAppHttpError extends Error {
   }
 }
 
+function runPuppeteerCli(cliPath: string, args: string[], timeoutMs: number) {
+  const result = spawnSync(process.execPath, [cliPath, ...args], {
+    timeout: timeoutMs,
+    encoding: "utf8",
+  });
+  return {
+    status: result.status,
+    stdout: (result.stdout ?? "").trim(),
+    stderr: (result.stderr ?? "").trim(),
+    error: result.error,
+  };
+}
+
 /**
  * Puppeteer is supposed to download its own Chrome during `npm install`,
  * but some PaaS build caches (observed on Render's native Node
@@ -54,12 +69,32 @@ export class WhatsAppHttpError extends Error {
  * this is guaranteed to run the exact same puppeteer install that
  * whatsapp-web.js itself requires — no risk of npx resolving a different
  * globally-fetched puppeteer version whose Chrome build id wouldn't match.
+ *
+ * Also pins PUPPETEER_CACHE_DIR to an explicit, universally-writable /tmp
+ * path (rather than trusting whatever $HOME/.cache resolves to on a given
+ * PaaS) so the install step and the later browser launch are guaranteed to
+ * agree on the same location, and logs a `browsers list` + disk-space
+ * check immediately after so the outcome is unambiguous in the logs either
+ * way.
  */
 function ensureChromeInstalled(): void {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     // Docker build path: a system Chromium is already provided.
     logger.info("Skipping Chrome install check (PUPPETEER_EXECUTABLE_PATH is set)");
     return;
+  }
+
+  if (!process.env.PUPPETEER_CACHE_DIR) {
+    process.env.PUPPETEER_CACHE_DIR = path.join("/tmp", "puppeteer-cache");
+  }
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR;
+
+  try {
+    const fsStats = statfsSync("/tmp");
+    const freeMb = Math.round((fsStats.bavail * fsStats.bsize) / 1024 / 1024);
+    logger.info(`Chrome cache dir: ${cacheDir} (/tmp has ${freeMb}MB free)`);
+  } catch (err) {
+    logger.warn("Could not stat /tmp filesystem", err instanceof Error ? err.message : err);
   }
 
   let cliPath: string;
@@ -70,24 +105,19 @@ function ensureChromeInstalled(): void {
     return;
   }
 
-  logger.info(`Ensuring Chrome is installed for Puppeteer (${cliPath})`);
-  try {
-    const output = execFileSync(process.execPath, [cliPath, "browsers", "install", "chrome"], {
-      timeout: 180_000,
-      encoding: "utf8",
-    });
-    logger.info(`Chrome install check: ${output.trim()}`);
-  } catch (err) {
-    const details =
-      err && typeof err === "object" && "stdout" in err
-        ? String((err as { stdout?: unknown }).stdout ?? "") + String((err as { stderr?: unknown }).stderr ?? "")
-        : err instanceof Error
-          ? err.message
-          : String(err);
-    logger.error("Failed to ensure Chrome is installed for Puppeteer", details);
-    // Don't throw — let client.initialize() below surface the real error
-    // (e.g. from Puppeteer itself) if Chrome truly isn't usable.
+  logger.info(`Installing Chrome for Puppeteer via ${cliPath}`);
+  const install = runPuppeteerCli(cliPath, ["browsers", "install", "chrome"], 180_000);
+  if (install.error) {
+    logger.error("Chrome install process failed to start", install.error.message);
+  } else {
+    logger.info(
+      `Chrome install exit=${install.status} stdout="${install.stdout || "(empty)"}" stderr="${install.stderr || "(empty)"}"`,
+    );
   }
+
+  const list = runPuppeteerCli(cliPath, ["browsers", "list"], 30_000);
+  logger.info(`Installed browsers per cache dir: "${list.stdout || "(none)"}" stderr="${list.stderr || "(empty)"}"`);
+  logger.info(`Cache dir exists on disk: ${existsSync(cacheDir)}`);
 }
 
 export class WhatsAppManager {
