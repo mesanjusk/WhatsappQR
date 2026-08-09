@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import mongoose from "mongoose";
 import QRCode from "qrcode";
 import { Client, RemoteAuth, type Chat as WWebChat, type Message as WWebMessage } from "whatsapp-web.js";
@@ -39,6 +40,33 @@ export class WhatsAppHttpError extends Error {
   }
 }
 
+/**
+ * Puppeteer is supposed to download its own Chrome during `npm install`,
+ * but some PaaS build caches (observed on Render's native Node
+ * environment) restore node_modules from a snapshot in a way that skips
+ * that download, leaving "Could not find Chrome" only once the server
+ * actually tries to launch it. A build-time postinstall step can't be
+ * trusted to always run, so this checks/installs at runtime instead —
+ * synchronously, in the same process and filesystem that is about to
+ * launch Puppeteer, right before it does.
+ */
+function ensureChromeInstalled(): void {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    // Docker build path: a system Chromium is already provided.
+    return;
+  }
+  try {
+    execFileSync("npx", ["--yes", "puppeteer", "browsers", "install", "chrome"], {
+      stdio: "inherit",
+      timeout: 120_000,
+    });
+  } catch (err) {
+    logger.error("Failed to ensure Chrome is installed for Puppeteer", err);
+    // Don't throw — let client.initialize() below surface the real error
+    // (e.g. from Puppeteer itself) if Chrome truly isn't usable.
+  }
+}
+
 export class WhatsAppManager {
   private client: Client | null = null;
   private io: SocketIOServer | null = null;
@@ -55,6 +83,7 @@ export class WhatsAppManager {
   private shuttingDown = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private chromeEnsured = false;
 
   attachIO(io: SocketIOServer): void {
     this.io = io;
@@ -82,6 +111,11 @@ export class WhatsAppManager {
     try {
       await connectToDatabase();
       await this.setStatus("INITIALIZING");
+
+      if (!this.chromeEnsured) {
+        ensureChromeInstalled();
+        this.chromeEnsured = true;
+      }
 
       const store = new MongoStore({ mongoose });
       const backupSyncIntervalMs = Number(process.env.WHATSAPP_BACKUP_SYNC_INTERVAL_MS) || 5 * 60 * 1000;
