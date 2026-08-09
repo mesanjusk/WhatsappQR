@@ -71,7 +71,15 @@ async function resolveLaunchConfig(): Promise<LaunchConfig> {
   try {
     const executablePath = await chromium.executablePath();
     logger.info(`Resolved bundled Chromium executable: ${executablePath}`);
-    return { executablePath, args: chromium.args };
+    // @sparticuz/chromium's recommended args include --single-process,
+    // tuned for AWS Lambda's one-shot-invocation execution model. It's
+    // documented in the whatsapp-web.js community as causing exactly the
+    // "QR keeps regenerating, scan never completes" symptom for long-running
+    // sessions — it destabilizes the background workers WhatsApp Web's
+    // realtime connection depends on. This app is a persistent process, not
+    // a one-shot Lambda invocation, so drop it.
+    const args = chromium.args.filter((arg) => arg !== "--single-process");
+    return { executablePath, args };
   } catch (err) {
     logger.error("Failed to resolve @sparticuz/chromium executable", err instanceof Error ? err.message : err);
     return { executablePath: undefined, args: DEFAULT_LAUNCH_ARGS };
