@@ -49,19 +49,42 @@ export class WhatsAppHttpError extends Error {
  * trusted to always run, so this checks/installs at runtime instead —
  * synchronously, in the same process and filesystem that is about to
  * launch Puppeteer, right before it does.
+ *
+ * Resolves Puppeteer's own local CLI script directly (not via `npx`) so
+ * this is guaranteed to run the exact same puppeteer install that
+ * whatsapp-web.js itself requires — no risk of npx resolving a different
+ * globally-fetched puppeteer version whose Chrome build id wouldn't match.
  */
 function ensureChromeInstalled(): void {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     // Docker build path: a system Chromium is already provided.
+    logger.info("Skipping Chrome install check (PUPPETEER_EXECUTABLE_PATH is set)");
     return;
   }
+
+  let cliPath: string;
   try {
-    execFileSync("npx", ["--yes", "puppeteer", "browsers", "install", "chrome"], {
-      stdio: "inherit",
-      timeout: 120_000,
-    });
+    cliPath = require.resolve("puppeteer/lib/cjs/puppeteer/node/cli.js");
   } catch (err) {
-    logger.error("Failed to ensure Chrome is installed for Puppeteer", err);
+    logger.error("Could not resolve puppeteer's CLI script", err);
+    return;
+  }
+
+  logger.info(`Ensuring Chrome is installed for Puppeteer (${cliPath})`);
+  try {
+    const output = execFileSync(process.execPath, [cliPath, "browsers", "install", "chrome"], {
+      timeout: 180_000,
+      encoding: "utf8",
+    });
+    logger.info(`Chrome install check: ${output.trim()}`);
+  } catch (err) {
+    const details =
+      err && typeof err === "object" && "stdout" in err
+        ? String((err as { stdout?: unknown }).stdout ?? "") + String((err as { stderr?: unknown }).stderr ?? "")
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    logger.error("Failed to ensure Chrome is installed for Puppeteer", details);
     // Don't throw — let client.initialize() below surface the real error
     // (e.g. from Puppeteer itself) if Chrome truly isn't usable.
   }
