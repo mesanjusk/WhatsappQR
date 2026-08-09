@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, statfsSync } from "node:fs";
 import path from "node:path";
+import { getInstalledBrowsers } from "@puppeteer/browsers";
 import mongoose from "mongoose";
 import QRCode from "qrcode";
 import { Client, RemoteAuth, type Chat as WWebChat, type Message as WWebMessage } from "whatsapp-web.js";
@@ -79,8 +80,16 @@ function runPuppeteerCli(cliPath: string, args: string[], timeoutMs: number) {
  * the time it's set, Puppeteer's own module-level default is already
  * fixed, so the only reliable way to point it at the installed browser is
  * to hand it the resolved path directly.
+ *
+ * The install step still shells out to Puppeteer's own CLI (it correctly
+ * resolves the exact Chrome build id this puppeteer version expects,
+ * without needing that hardcoded here), but the *lookup* of what actually
+ * ended up installed uses @puppeteer/browsers' structured
+ * getInstalledBrowsers() API directly — not text-parsed CLI output — so
+ * there's no risk of a parsing mismatch producing a path that looks right
+ * but isn't the one Puppeteer itself would resolve.
  */
-function resolveChromeExecutablePath(): string | undefined {
+async function resolveChromeExecutablePath(): Promise<string | undefined> {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     // Docker build path: a system Chromium is already provided.
     logger.info("Using PUPPETEER_EXECUTABLE_PATH (Docker/system Chromium)");
@@ -118,21 +127,25 @@ function resolveChromeExecutablePath(): string | undefined {
     );
   }
 
-  const list = runPuppeteerCli(cliPath, ["browsers", "list"], 30_000);
-  logger.info(`Installed browsers per cache dir: "${list.stdout || "(none)"}" stderr="${list.stderr || "(empty)"}"`);
-  logger.info(`Cache dir exists on disk: ${existsSync(cacheDir)}`);
+  let installed: Awaited<ReturnType<typeof getInstalledBrowsers>>;
+  try {
+    installed = await getInstalledBrowsers({ cacheDir });
+  } catch (err) {
+    logger.error("getInstalledBrowsers() failed", err instanceof Error ? err.message : err);
+    return undefined;
+  }
+  logger.info(`getInstalledBrowsers(): ${JSON.stringify(installed.map((b) => ({ browser: b.browser, buildId: b.buildId, executablePath: b.executablePath })))}`);
 
-  // Parse a line like: "chrome@146.0.7680.31 (linux) /tmp/puppeteer-cache/chrome/linux-146.0.7680.31/chrome-linux64/chrome"
-  const chromeLine = list.stdout.split("\n").find((line) => line.trim().startsWith("chrome@"));
-  const executablePath = chromeLine?.trim().split(/\s+/).pop();
-
-  if (!executablePath || !existsSync(executablePath)) {
-    logger.error(`Could not resolve a usable Chrome executable path (parsed: ${executablePath ?? "none"})`);
+  const chrome = installed.find((b) => b.browser === "chrome");
+  if (!chrome || !existsSync(chrome.executablePath)) {
+    logger.error(
+      `Could not resolve a usable Chrome executable path (found: ${chrome?.executablePath ?? "none"})`,
+    );
     return undefined;
   }
 
-  logger.info(`Resolved Chrome executable path: ${executablePath}`);
-  return executablePath;
+  logger.info(`Resolved Chrome executable path: ${chrome.executablePath}`);
+  return chrome.executablePath;
 }
 
 export class WhatsAppManager {
@@ -182,7 +195,7 @@ export class WhatsAppManager {
       await this.setStatus("INITIALIZING");
 
       if (!this.chromeResolved) {
-        this.chromeExecutablePath = resolveChromeExecutablePath();
+        this.chromeExecutablePath = await resolveChromeExecutablePath();
         this.chromeResolved = true;
       }
 
