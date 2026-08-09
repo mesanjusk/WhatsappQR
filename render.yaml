@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: whatsapp-web-clone
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /login
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: NEXT_PUBLIC_APP_URL
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: WHATSAPP_SESSION_ID
+        value: default
+      - key: WHATSAPP_BACKUP_SYNC_INTERVAL_MS
+        value: "300000"
+      - key: NODE_ENV
+        value: production

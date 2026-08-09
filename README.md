@@ -150,11 +150,14 @@ handshake requires the same signed session cookie as the REST API.
 
 ## Known limitations
 
-- **Single-process singleton.** `WhatsAppManager` lives in one Node
-  process's memory. This app must run as a single persistent instance (one
-  VM/container/PM2 process) — it does not work behind horizontal
-  autoscaling/multiple replicas, since each instance would try to own the
-  one WhatsApp account's browser session.
+- **Single-process singleton, no serverless.** `WhatsAppManager` lives in
+  one Node process's memory. This app must run as a single persistent
+  instance (one VM/container/PM2 process, e.g. Render/Railway/Fly.io/a
+  VPS) — it does not work behind horizontal autoscaling/multiple replicas,
+  and it does not work on serverless platforms (Vercel, Netlify Functions,
+  AWS Lambda, etc.) at all, since those never keep a process — or the
+  Socket.IO server, or the Puppeteer/WhatsApp session — running between
+  requests. See "Why not Vercel" above.
 - **`tsx` at runtime.** `server.ts` runs via `tsx` (TypeScript executed
   directly by Node) rather than a separate compile step, for both dev and
   `npm start`. This is simple and fine for an MVP; a stricter production
@@ -188,6 +191,56 @@ Chromium: by default the Chromium bundled with `whatsapp-web.js`'s
 Puppeteer dependency is used. In a minimal Docker/Linux image without the
 libraries Chromium needs, either use a base image that has them, or install
 a system Chromium/Chrome and set `PUPPETEER_EXECUTABLE_PATH`.
+
+### Why not Vercel
+
+This app **cannot** run on Vercel (or any serverless platform). Vercel never
+executes `server.ts` — it builds Next.js and serves each route as a
+stateless, time-limited function, so the Socket.IO server and the one
+persistent `WhatsAppManager`/Puppeteer session this app depends on are never
+created. `/api/socket.io` 404s and every `/api/whatsapp/*` route fails with
+`WhatsApp manager has not been initialized yet.` This isn't fixable with
+configuration — it needs a host that keeps one Node process running
+continuously, like Render, Railway, Fly.io, or a VPS.
+
+### Deploying to Render
+
+The repo includes a `Dockerfile` that installs system Chromium and the
+runtime libraries Puppeteer needs to launch headless.
+
+1. **MongoDB**: Render doesn't offer managed MongoDB — use
+   [MongoDB Atlas](https://www.mongodb.com/atlas) (the free M0 tier works
+   fine for an MVP) and copy its connection string.
+2. In the Render dashboard: **New +** → **Web Service** → connect this
+   GitHub repo (branch `claude/whatsapp-web-clone-mvp-gzz87q`, or whichever
+   branch you're deploying).
+3. Render should detect the `Dockerfile` and offer **Docker** as the
+   runtime/environment — pick that (do *not* pick the Node native
+   environment; it won't have Chromium's system libraries). No build/start
+   command fields are needed — the Dockerfile's own build steps and
+   `CMD ["npm", "start"]` handle both.
+4. **Plan**: pick at least the paid **Starter** instance type, not Free.
+   Render's free web services spin down after ~15 minutes of inactivity,
+   which would kill the live WhatsApp/Puppeteer session and stop real-time
+   incoming messages from being received while spun down — this app needs
+   an always-on instance.
+5. Add the environment variables (Settings → Environment):
+   - `MONGODB_URI` — your Atlas connection string
+   - `ADMIN_EMAIL`, `ADMIN_PASSWORD` — your login credentials
+   - `JWT_SECRET` — a long random string (`openssl rand -hex 48`)
+   - `NEXT_PUBLIC_APP_URL` — the `https://<your-service>.onrender.com` URL
+     (Render shows this after the first deploy; fill it in and redeploy)
+   - `WHATSAPP_SESSION_ID=default`,
+     `WHATSAPP_BACKUP_SYNC_INTERVAL_MS=300000`
+6. Deploy. Render builds the Docker image and starts the service, listening
+   on the `PORT` it injects automatically (already handled by `server.ts`).
+
+A `render.yaml` blueprint is also included as a convenience for Render's
+**New +** → **Blueprint** flow, which can pre-fill most of this — but its
+exact schema wasn't verified against Render's current docs in this session
+(this sandbox has no network access to render.com), so treat it as a
+starting point: if the blueprint import errors or looks off, fall back to
+the manual steps above, which don't depend on that file at all.
 
 ## Manual test checklist
 
