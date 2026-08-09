@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+:root {
+  --wa-green: #25d366;
+  --wa-teal-dark: #075e54;
+  --wa-panel: #f0f2f5;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: #ffffff;
+  color: #111b21;
+}
